@@ -1,0 +1,215 @@
+#!/bin/bash -l
+#
+# This script installs the services and tools needed for our MinIO deployment. It should be
+# run by the root user from a fresh Ubuntun installation. The following ENV variables are
+# required:
+# - ROOT_PASSWORD: The root secret key for the MinIO server (access key will be "root")
+# - DOMAIN: The domain name for the MinIO server, the full host will be <hostname>.<domain>
+# - SERVER_URL: The URL of the load balancer for the MinIO deployment or any one of the MinIO hosts (MUST be the same across all nodes). Eg. https://minio-1.<domain>
+# - CERTBOT_EMAIL: The email address to use for Let's Encrypt certificate generation
+
+if [ -z "$ROOT_PASSWORD" ]; then
+  echo "ERROR: ROOT_PASSWORD is not set" && exit 1
+fi
+
+if [ -z "$DOMAIN" ]; then
+  echo "ERROR: DOMAIN is not set" && exit 1
+fi
+
+if [ -z "$SERVER_URL" ]; then
+  echo "ERROR: SERVER_URL is not set" && exit 1
+fi
+
+if [ -z "$CERTBOT_EMAIL" ]; then
+  echo "ERROR: CERTBOT_EMAIL is not set" && exit 1
+fi
+
+set -e
+
+# Timezone
+timedatectl set-timezone UTC
+
+# Fix annoying locale warnings
+echo LANG=en_US.utf-8 >> /etc/environment
+echo LC_ALL=en_US.utf-8 >> /etc/environment
+
+# Update and upgrade
+export DEBIAN_FRONTEND=noninteractive
+apt update
+apt dist-upgrade -y --allow-downgrades --allow-remove-essential --allow-change-held-packages
+
+# Essential packages
+apt install smartmontools snapd btop -y
+
+# Ruby for scripting support
+snap install ruby --classic
+
+# Format MinIO drives using XFS as recommended in the documentation:
+# https://min.io/docs/minio/linux/operations/checklists/hardware.html#use-xfs-formatted-drives-with-labels
+
+BASE_MOUNT_DIR="/mnt/drive-"
+
+# map for device a - j
+declare -A device_map
+device_map=( [a]=1 [b]=2 [c]=3 [d]=4 [e]=5 [f]=6 [g]=7 [h]=8 [i]=9 [j]=10 )
+
+for letter in "${!device_map[@]}"; do
+  DEVICE="/dev/sd${letter}"
+  MOUNT_NUM=${device_map[$letter]}
+  MOUNT_POINT="${BASE_MOUNT_DIR}${MOUNT_NUM}"
+
+  mkfs.xfs -f $DEVICE -L "MINIODRIVE$MOUNT_NUM"
+
+  # Create the mount point directory
+  echo "Creating mount point ${MOUNT_POINT}"
+  mkdir -p "${MOUNT_POINT}"
+
+  # MinIO strongly recommends using label-based mounting rules over UUID-based rules.
+  # Label-based rules allow swapping an unhealthy or non-working drive with a replacement
+  # that has matching format and label.
+  FSTAB_ENTRY="LABEL=MINIODRIVE${MOUNT_NUM} ${MOUNT_POINT} xfs defaults,nofail 0 2"
+
+  # Check if the entry already exists in fstab
+  if grep -q "$FSTAB_ENTRY" /etc/fstab; then
+    echo "Entry for ${DEVICE} already exists in /etc/fstab, skipping..."
+  else
+    # Append the entry to /etc/fstab
+    echo "Adding entry for ${DEVICE} to /etc/fstab"
+    echo "${FSTAB_ENTRY}" | sudo tee -a /etc/fstab > /dev/null
+  fi
+done
+
+# Mount drives including new fstab entries
+mount --all
+
+# Tweak the XFS configuration as recommended in the documentation:
+# https://min.io/docs/minio/linux/operations/checklists/hardware.html#disable-xfs-retry-on-error
+
+CRON_SCRIPTS_LOCATION=/etc/cron/scripts
+mkdir -p $CRON_SCRIPTS_LOCATION
+
+cat <<'EOF' > $CRON_SCRIPTS_LOCATION/xfs-retry-settings.sh
+#!/bin/bash
+
+set -e
+
+# https://min.io/docs/minio/linux/operations/checklists/hardware.html#disable-xfs-retry-on-error
+
+for i in $(df -h | grep /mnt/drive | awk '{ print $1 }'); do
+  mount_path="$(df -h | grep $i | awk '{ print $6 }')"
+  device_name="$(basename $i)"
+  echo "Modifying xfs max_retries and retry_timeout_seconds for drive $i mounted at $mount_path"
+  echo 0 > /sys/fs/xfs/$device_name/error/metadata/EIO/max_retries
+  echo 0 > /sys/fs/xfs/$device_name/error/metadata/ENOSPC/max_retries
+  echo 0 > /sys/fs/xfs/$device_name/error/metadata/default/max_retries
+done
+EOF
+
+chmod +x $CRON_SCRIPTS_LOCATION/xfs-retry-settings.sh
+$CRON_SCRIPTS_LOCATION/xfs-retry-settings.sh
+(crontab -l 2>/dev/null; echo "@reboot $CRON_SCRIPTS_LOCATION/xfs-retry-settings.sh") | crontab -
+
+# Automated TLS certificates via Certbot
+
+snap install --classic certbot
+ln -s /snap/bin/certbot /usr/bin/certbot
+
+# Certificates will be stored at /etc/letsencrypt/live/$HOST/
+HOST=$(hostname).$DOMAIN
+certbot certonly --standalone -d $HOST --staple-ocsp -m $CERTBOT_EMAIL --agree-tos -n
+
+# Install MinIO in a multi node, multi drive configuration:
+# https://min.io/docs/minio/linux/operations/install-deploy-manage/deploy-minio-multi-node-multi-drive.html
+
+wget https://dl.min.io/server/minio/release/linux-amd64/minio_20240303175039.0.0_amd64.deb
+dpkg -i minio_20240303175039.0.0_amd64.deb
+
+# Allow MinIO to bind to privileged ports without root access
+setcap 'cap_net_bind_service=+ep' `which minio`
+
+# Install the mc CLI
+curl https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/bin/mc
+chmod +x /usr/bin/mc
+
+# Create the minio-user and group and give it ownership of all the drives.
+# This user is used by the systemd service created by the deb package.
+groupadd -r minio-user
+useradd -M -r -g minio-user minio-user
+for i in {1..10}; do
+  chown minio-user:minio-user "/mnt/drive-$i"
+done
+
+# Create the MinIO configuration directory and create a cron job to copy the
+# certificates generated by Certbot.
+mkdir -p /home/minio-user/.minio/certs
+chown -R minio-user:minio-user /home/minio-user
+
+cat <<EOF > $CRON_SCRIPTS_LOCATION/copy-certs.sh
+#!/bin/bash
+
+set -e
+
+cp /etc/letsencrypt/live/$HOST/fullchain.pem /home/minio-user/.minio/certs/public.crt
+cp /etc/letsencrypt/live/$HOST/privkey.pem /home/minio-user/.minio/certs/private.key
+chown -R minio-user:minio-user /home/minio-user/.minio/certs
+EOF
+
+chmod +x $CRON_SCRIPTS_LOCATION/copy-certs.sh
+$CRON_SCRIPTS_LOCATION/copy-certs.sh
+(crontab -l 2>/dev/null; echo "0 0 * * * $CRON_SCRIPTS_LOCATION/copy-certs.sh") | crontab -
+
+
+# Configure MinIO
+cat <<EOF > /etc/default/minio
+# Set the hosts and volumes MinIO uses at startup
+# The command uses MinIO expansion notation {x...y} to denote a
+# sequential series.
+#
+# The following example covers four MinIO hosts
+# with 10 drives each at the specified hostname and drive locations.
+# The command includes the port that each MinIO server listens on.
+
+MINIO_VOLUMES="https://minio-{1...4}.$DOMAIN:443/$BASE_MOUNT_DIR{1...10}/minio"
+
+# Set all MinIO server options
+#
+# The following explicitly sets the MinIO Console listen address to
+# port 9001 on all network interfaces. The default behavior is dynamic
+# port selection.
+
+MINIO_OPTS="--console-address :9001 --address :443"
+
+# Set the root username. This user has unrestricted permissions to
+# perform S3 and administrative API operations on any resource in the
+# deployment.
+#
+# Defer to your organizations requirements for superadmin user name.
+
+MINIO_ROOT_USER=root
+
+# Set the root password
+#
+# Use a long, random, unique string that meets your organizations
+# requirements for passwords.
+
+MINIO_ROOT_PASSWORD=$ROOT_PASSWORD
+
+# Set to the URL of the load balancer for the MinIO deployment
+# This value *must* match across all MinIO servers. If you do
+# not have a load balancer, set this value to to any *one* of the
+# MinIO hosts in the deployment as a temporary measure.
+
+MINIO_SERVER_URL="$SERVER_URL"
+EOF
+
+systemctl start minio
+systemctl status minio
+systemctl enable minio
+
+mc alias set local https://$HOST root $ROOT_PASSWORD
+mc admin info local
+
+echo
+echo "All done! 🎉"
+echo
+echo "Please reboot the machine to complete the installation."
