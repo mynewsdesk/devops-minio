@@ -57,6 +57,112 @@ PRIVATE_KEY=~/.ssh/<minio-node-private-key>
 
 for i in {1..4}; do
   scp -i $PRIVATE_KEY bin/bootstrap root@minio-$i.$DOMAIN:
-  ssh -i $PRIVATE_KEY root@minio-$i.$DOMAIN "chmod +x ./bootstrap && ROOT_PASSWORD=$ROOT_PASSWORD DOMAIN=$DOMAIN SERVER_URL=$SERVER_URL CERTBOT_EMAIL=$CERTBOT_EMAIL time ./bootstrap && reboot"
+  ssh -i $PRIVATE_KEY root@minio-$i.$DOMAIN "ROOT_PASSWORD=$ROOT_PASSWORD DOMAIN=$DOMAIN SERVER_URL=$SERVER_URL CERTBOT_EMAIL=$CERTBOT_EMAIL time ./bootstrap && reboot"
 done
+```
+
+### Installation notes
+
+MinIO will run as the `minio` service added to systemd via `/lib/systemd/system/minio.service`.
+
+The configuration can be found at `/etc/default/minio`.
+
+Logs can be tailed via `journalctl -fu minio`.
+
+## Ensure MinIO is running
+
+After all nodes have been bootstrapped and rebooted. MinIO should be up and running. Let's verify that by checking the status of the MinIO service:
+
+```bash
+for i in {1..4}; do
+  ssh -i $PRIVATE_KEY root@minio-$i.$DOMAIN "
+    systemctl status minio --lines 0 &&
+    mc alias set local https://minio-$i.$DOMAIN root $ROOT_PASSWORD
+    mc admin info local
+  "
+done
+```
+
+## Add suppport for bucket encryption
+
+MinIO supports SSE bucket encryption for full encryption at rest compliance. This requires adding and configuring [KES](https://github.com/minio/kes) on our cluster. To do this up we will run the `add-kes` script on each node.
+
+Note that this script assumes using AWS Secrets Manager to store the main encryption keys. See documentation at https://min.io/docs/minio/container/operations/server-side-encryption/configure-minio-kes-aws.html for details.
+
+Feel free to integrate using any other support secret manager by modifying the script.
+
+The default key name used to encrypt all objects will be `minio-backend-default-key`. You can override the key on a per bucket basis if desired. Or tweak the script if you want a different name or disable cluster-wide default encryption.
+
+When preparing the `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, ensure that the IAM user has the following permissions:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "minioSecretsManagerAccess",
+      "Action": [
+        "secretsmanager:CreateSecret",
+        "secretsmanager:DeleteSecret",
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:ListSecrets"
+      ],
+      "Effect": "Allow",
+      "Resource": "*"
+    },
+    {
+      "Sid": "minioKmsAccess",
+      "Action": [
+        "kms:Decrypt",
+        "kms:DescribeKey",
+        "kms:Encrypt"
+      ],
+      "Effect": "Allow",
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+Run the add-kes script on all nodes:
+
+```bash
+AWS_REGION=<aws-region>
+AWS_ACCESS_KEY_ID=<aws-access-key-id>
+AWS_SECRET_ACCESS_KEY=<aws-secret-access-key>
+
+for i in {1..4}; do
+  scp -i $PRIVATE_KEY bin/add-kes root@minio-$i.$DOMAIN:
+  ssh -i $PRIVATE_KEY root@minio-$i.$DOMAIN "AWS_REGION=$AWS_REGION AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY ./add-kes"
+done
+```
+
+Now we will have to separately restart minio on all the nodes to apply the changes. The restart was not included in the script since the restart command will freeze the script until a majority of nodes have been found to include the new configuration settings.
+
+Note the ampersand at the end of the command to run it on multiple servers in the background.
+
+```bash
+for i in {1..4}; do
+  ssh -i $PRIVATE_KEY root@minio-$i.$DOMAIN "systemctl restart minio" &
+done
+```
+
+## Benchmarking MinIO
+
+To benchmark MinIO we can use the S3 benchmarking tool [warp](https://github.com/minio/warp).
+
+> [!NOTE]
+> It's highly likely you'll end up bottlenecked by the network speed of the server you are running the benchmark from. Eg. if you're running on a 10Gbit network you should see around 1.25GB/s cluster performance. But the benchmark can still serve as a good indication if your cluster is healthy and all disks are functioning as expected. If you want to push the limits of your cluster, you can try the more complicated [distributed benchmark](https://github.com/minio/warp?tab=readme-ov-file#distributed-benchmarking) feature.
+
+SSH into one of the MinIO nodes or an adjecent server on a fast network and run the following commands:
+
+```bash
+wget https://github.com/minio/warp/releases/download/v0.8.0/warp_Linux_x86_64.deb
+dpkg -i warp_Linux_x86_64.deb
+
+warp mixed \
+  --host=minio-{1..4}.<domain> \
+  --access-key=<minio-access-key> \
+  --secret-key=<minio-access-secret> \
+  --tls
 ```

@@ -1,0 +1,173 @@
+#!/bin/bash -l
+#
+# This script adds support for bucket SSE encryption for our MinIO deployment via KES
+# integrating with AWS Secrets Manager. It should be run by the root user on all nodes
+# in the MinIO deployment.
+#
+# The following ENV variables are required:
+# - AWS_REGION: The AWS region where the Secrets Manager is located
+# - AWS_ACCESS_KEY_ID: A AWS access key ID with access to Secrets Manager
+# - AWS_SECRET_ACCESS_KEY: The secret key for the AWS access key
+
+if [ -z "$AWS_REGION" ]; then
+  echo "ERROR: AWS_REGION is not set" && exit 1
+fi
+
+if [ -z "$AWS_ACCESS_KEY_ID" ]; then
+  echo "ERROR: AWS_ACCESS_KEY_ID is not set" && exit 1
+fi
+
+if [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+  echo "ERROR: AWS_SECRET_ACCESS_KEY is not set" && exit 1
+fi
+
+wget --quiet https://github.com/minio/kes/releases/download/2024-02-29T08-12-28Z/kes_2024-02-29T08-12-28Z_linux_amd64.deb
+
+dpkg -i kes_2024-02-29T08-12-28Z_linux_amd64.deb
+
+# Allow mlock on the kes binary to prevent swapping which can lead to data leaks
+setcap cap_ipc_lock=+ep $(readlink -f $(which kes))
+
+mkdir -p /home/minio-user/.kes/certs
+
+KES_CLIENT_CERT=/home/minio-user/.kes/certs/kes.cert
+KES_CLIENT_KEY=/home/minio-user/.kes/certs/kes.key
+KES_DEFAULT_KEY_NAME=minio-backend-default-key
+
+kes identity new --ip "127.0.0.1" --expiry 946728h --cert $KES_CLIENT_CERT --key $KES_CLIENT_KEY --force localhost
+
+cat <<EOF >> ~/.profile
+
+# kes CLI configuration
+export KES_SERVER=https://127.0.0.1:7373
+export KES_CLIENT_CERT=$KES_CLIENT_CERT
+export KES_CLIENT_KEY=$KES_CLIENT_KEY
+
+EOF
+
+KES_CERT_IDENTITY=`kes identity of /home/minio-user/.kes/certs/kes.cert`
+
+cat <<EOF > /home/minio-user/.kes/config.yaml
+address: 127.0.0.1:7373
+
+# Disable the admin identity, as we do not need that level of access for
+# supporting SSE operations.
+admin:
+  identity: disabled
+
+# Specify the TLS keys generated in the previous step here
+# For production environments, use keys signed by a known and trusted
+# Certificate Authority (CA).
+tls:
+  cert: $KES_CLIENT_CERT
+  key: $KES_CLIENT_KEY
+  auth: "off"
+
+# Create a policy named 'minio' that grants access to the
+# /create, /generate, and /decrypt KES APIs for any key name
+# KES uses mTLS to grant access to this policy, where only the client
+# whose TLS certificate hash matches one of the "identities" can
+# use this policy. Specify the hash of the MinIO server TLS certificate
+# hash here.
+policy:
+  minio:
+    allow:
+      - /v1/key/create/*   # You can replace these wildcard '*' with a string prefix to restrict key names
+      - /v1/key/generate/* # e.g. '/minio-'
+      - /v1/key/decrypt/*
+      - /v1/key/bulk/decrypt
+      - /v1/key/list/*
+      - /v1/status
+      - /v1/metrics
+      - /v1/log/audit
+      - /v1/log/error
+    identities:
+      - $KES_CERT_IDENTITY
+
+# Specify the connection information for the KMS and Secrets Manager endpoint.
+# The endpoint should be resolvable from the host.
+# This example assumes that the associated AWS account has the necessary
+# access key and secret key
+keystore:
+  aws:
+    secretsmanager:
+      endpoint: secretsmanager.$AWS_REGION.amazonaws.com
+      region: $AWS_REGION
+      # Optional. The root AWS KMS key. Formerly known as "Customer Master Key".
+      # kmskey: ""
+      credentials:
+        accesskey: $AWS_ACCESS_KEY_ID
+        secretkey: $AWS_SECRET_ACCESS_KEY
+
+# These are highly liberal settings for the key cache. Lower the cache expiry if you're paraniod.
+# Reference: https://min.io/docs/kes/tutorials/configuration/#cache-configuration
+cache:
+  expiry:
+    any: 15m
+    unused: 1m
+EOF
+
+chown -R minio-user:minio-user /home/minio-user
+
+echo "Adding KES configuration to MinIO at /etc/default/minio"
+
+cat <<EOF >> /etc/default/minio
+
+# Configure KES for bucket encryption
+MINIO_KMS_KES_ENDPOINT=https://127.0.0.1:7373
+MINIO_KMS_KES_CERT_FILE=$KES_CLIENT_CERT
+MINIO_KMS_KES_KEY_FILE=$KES_CLIENT_KEY
+MINIO_KMS_KES_CAPATH=$KES_CLIENT_CERT
+MINIO_KMS_KES_KEY_NAME=$KES_DEFAULT_KEY_NAME
+MINIO_KMS_AUTO_ENCRYPTION=on
+
+# Though using API key instead of cert/key is recommended, automating it is unreliable
+# MINIO_KMS_KES_API_KEY=...
+EOF
+
+echo "Creating the kes systemd service at /usr/lib/systemd/system/kes.service"
+
+cat <<EOF > /usr/lib/systemd/system/kes.service
+[Unit]
+Description=KES
+Documentation=https://github.com/minio/kes/wiki
+Wants=network-online.target
+After=network-online.target
+AssertFileIsExecutable=/usr/bin/kes
+
+[Service]
+WorkingDirectory=/home/minio-user/.kes
+
+AmbientCapabilities=CAP_IPC_LOCK
+
+User=minio-user
+Group=minio-user
+ProtectProc=invisible
+
+ExecStart=/usr/bin/kes server --config=/home/minio-user/.kes/config.yaml
+
+# Let systemd restart this service always
+Restart=always
+
+# Specifies the maximum file descriptor number that can be opened by this process
+LimitNOFILE=65536
+
+# Specifies the maximum number of threads this process can create
+TasksMax=infinity
+
+# Disable timeout logic and wait until process is stopped
+TimeoutStopSec=infinity
+SendSIGKILL=no
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "Starting and enabling the kes service"
+
+systemctl start kes
+systemctl enable kes
+
+echo
+echo "KES has been successfully installed. However, it will not be fully operational until the MinIO service is restarted. Please restart the MinIO service on all nodes simultaneously to enable KES."
+echo
