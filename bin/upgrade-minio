@@ -1,0 +1,37 @@
+# !/bin/bash
+#
+# Usage:
+# bin/upgrade-minio <release-url>
+#
+# Example:
+# bin/upgrade-minio https://dl.min.io/server/minio/release/linux-amd64/minio_20240315010719.0.0_amd64.deb
+
+set -e
+
+if [ -z "$1" ]; then
+  echo "ERROR: No release URL provided" && exit 1
+fi
+
+release_url=$1
+release_filename=$(basename $release_url)
+
+for i in $(seq 1 4); do
+  server=storage$i
+  ssh $server "
+    wget --quiet $release_url &&
+    dpkg -i $release_filename &&
+    setcap 'cap_net_bind_service=+ep' /usr/local/bin/minio &&
+    rm $release_filename &&
+    systemctl daemon-reload &&
+    systemctl restart minio &&
+    sleep 2 &&
+    journalctl -u minio --no-pager | tail -n 30 &&
+    mc admin info local
+  "
+  echo "Upgrade complete for $server\n\n"
+  if [ $i -lt 4 ]; then
+    read -p "Press enter to continue with the next server or Ctrl+C to exit..."
+  fi
+done
+
+echo "Upgrade complete for all servers 💪"

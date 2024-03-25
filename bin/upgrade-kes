@@ -1,0 +1,35 @@
+# !/bin/bash
+#
+# Usage:
+# bin/upgrade-kes <release-url>
+#
+# Example:
+# bin/upgrade-kes https://github.com/minio/kes/releases/download/2024-03-13T17-52-13Z/kes_2024-03-13T17-52-13Z_linux_amd64.deb
+
+set -e
+
+if [ -z "$1" ]; then
+  echo "ERROR: No release URL provided" && exit 1
+fi
+
+release_url=$1
+release_filename=$(basename $release_url)
+
+for i in $(seq 1 4); do
+  server=storage$i
+  ssh $server "
+    wget --quiet $release_url &&
+    dpkg -i $release_filename &&
+    rm $release_filename &&
+    systemctl daemon-reload &&
+    systemctl restart kes &&
+    sleep 1 &&
+    journalctl -u kes --no-pager | tail -n 30
+  "
+  echo "Upgrade complete for $server\n\n"
+  if [ $i -lt 4 ]; then
+    read -p "Press enter to continue with the next server or Ctrl+C to exit..."
+  fi
+done
+
+echo "Upgrade complete for all servers 💪"
