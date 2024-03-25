@@ -157,7 +157,7 @@ Just run `apt update` and `apt upgrade` as usual. When reboots are required, slo
 
 ### Upgrading MinIO
 
-Find the latest version of MinIO at: https://min.io/download#/agpl-linux (DEB tab)
+Copy the download URL for the latest version of MinIO at: https://min.io/download#/agpl-linux (DEB tab)
 
 Then run:
 
