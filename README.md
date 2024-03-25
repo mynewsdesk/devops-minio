@@ -71,7 +71,7 @@ Logs can be tailed via `journalctl -fu minio`.
 
 ## Ensure MinIO is running
 
-After all nodes have been bootstrapped and rebooted. MinIO should be up and running. Let's verify that by checking the status of the MinIO service:
+After all nodes have been bootstrapped and rebooted. MinIO should be up and running. Let's verify that by checking the status of the MinIO service. This also adds the local minio server to the `mc` CLI tool with the alias `local`:
 
 ```bash
 for i in {1..4}; do
@@ -146,6 +146,37 @@ for i in {1..4}; do
   ssh -i $PRIVATE_KEY root@minio-$i.$DOMAIN "systemctl restart minio" &
 done
 ```
+
+## Upgrading
+
+Prerequisites: These upgrade scripts require having added `~/.ssh/config` entries for each minio node with the names `storage1`, `storage2`, `storage3` and `storage4`. This is to simplify the upgrade process by not having to specify IP, user and private key for each node.
+
+### Upgrading Ubuntu
+
+Just run `apt update` and `apt upgrade` as usual. When reboots are required, slowly reboot one node at the time and verify that the cluster is healthy via `mc admin info` before proceeding with the next node. Expect reboots to take a bit more than 2 minutes.
+
+### Upgrading MinIO
+
+Find the latest version of MinIO at: https://min.io/download#/agpl-linux (DEB tab)
+
+Then run:
+
+```bash
+bin/upgrade-minio <download-url>
+```
+
+
+### Upgrading KES
+
+Copy the download URL for the latest version of KES at: https://github.com/minio/kes/releases (show all releases -> xxx_amd64.deb file).
+
+Then run:
+
+```bash
+bin/upgrade-kes <download-url>
+```
+
+This will download the specified version of KES and install it on each node. You will be prompted before proceeding in between each node so you can verify that the upgrade was successful.
 
 ## Benchmarking MinIO
 
