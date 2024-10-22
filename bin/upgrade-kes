@@ -3,6 +3,8 @@
 # Usage:
 # bin/upgrade-kes <release-url>
 #
+# Get release URL from https://github.com/minio/kes/releases
+#
 # Example:
 # bin/upgrade-kes https://github.com/minio/kes/releases/download/2024-03-13T17-52-13Z/kes_2024-03-13T17-52-13Z_linux_amd64.deb
 
