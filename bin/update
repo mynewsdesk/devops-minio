@@ -1,0 +1,6 @@
+#!/bin/bash
+
+# Update ruby-build
+bin/execute-command "apt update"
+bin/execute-command "DEBIAN_FRONTEND=noninteractive apt upgrade -y"
+bin/execute-command "apt autoremove -y"

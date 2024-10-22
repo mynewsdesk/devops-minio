@@ -1,0 +1,14 @@
+#!/bin/bash
+
+# Command to run
+command=$1
+
+if [ ! -f ~/.ssh/devops-talos-manager.pem ]; then
+  echo "Error: You must add the ~/.ssh/devops-talos-manager.pem private key for authentication"
+  fatal
+fi
+
+for i in $(seq 1 4); do
+  server=storage$i
+  ssh root@$server -i ~/.ssh/devops-talos-manager.pem $command
+done
